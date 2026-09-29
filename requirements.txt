@@ -1,0 +1,6 @@
+# 鸡哥解题 运行依赖
+# 安装：.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.org/simple
+
+PySide6>=6.6        # 界面：悬浮窗 / 截图遮罩 / 托盘 / 设置
+pynput>=1.7.6       # 全局热键（Windows 用户态键盘钩子，免管理员）
+httpx>=0.27         # 调用 OpenAI 兼容接口（含流式）
