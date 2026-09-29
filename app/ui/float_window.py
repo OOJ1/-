@@ -28,12 +28,19 @@ from app.engine.base import SolveRequest
 from app.logger import get
 from app.store import Store
 from app.ui import formatting, theme
+from app.ui.jelly import JellyBubble
 from app.ui.worker import SolveWorker
 
 log = get("float")
 
-COLLAPSED_SIZE = QSize(56, 56)
+# 比球体本身大一圈，多出来的空间留给果冻弹性放大与光晕
+# （球径 = 边长 - 2*PADDING = 68 - 16 = 52，和原来的球一样大）
+COLLAPSED_SIZE = QSize(68, 68)
 EXPANDED_SIZE = QSize(400, 540)
+
+
+# 判定「算拖动」的累计位移。太小会被手抖误判成拖动，太大则拖动被当点击
+DRAG_THRESHOLD = 5
 
 
 class DragHandle(QWidget):
@@ -45,6 +52,7 @@ class DragHandle(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._offset: QPoint | None = None
+        self._press_pos: QPoint | None = None
         self._moved = False
         self.setCursor(Qt.SizeAllCursor)
 
@@ -52,17 +60,22 @@ class DragHandle(QWidget):
         if event.button() != Qt.LeftButton:
             return
         window = self.window()
-        self._offset = event.globalPosition().toPoint() - window.frameGeometry().topLeft()
+        self._press_pos = event.globalPosition().toPoint()
+        self._offset = self._press_pos - window.frameGeometry().topLeft()
         self._moved = False
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._offset is None or not (event.buttons() & Qt.LeftButton):
             return
-        target = event.globalPosition().toPoint() - self._offset
-        if (target - self.window().pos()).manhattanLength() > 3:
-            self._moved = True
-        self.window().move(target)
+        current = event.globalPosition().toPoint()
+        # 用「相对按下点的累计位移」判断，绝不能用「相对上一次移动的增量」：
+        # 鼠标慢慢挪的时候每次增量只有一两个像素，永远够不到阈值，
+        # 于是拖完一松手被判成单击 —— 悬浮球一拖就被点开，就是这个原因。
+        if not self._moved and self._press_pos is not None:
+            if (current - self._press_pos).manhattanLength() > DRAG_THRESHOLD:
+                self._moved = True
+        self.window().move(current - self._offset)
         event.accept()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -70,12 +83,21 @@ class DragHandle(QWidget):
             return
         was_moved = self._moved
         self._offset = None
+        self._press_pos = None
         self._moved = False
         if was_moved:
             self.moved.emit()
         else:
             self.clicked.emit()
         event.accept()
+
+
+class JellyBubbleHandle(JellyBubble, DragHandle):
+    """果冻球的外观 + 可拖拽行为。
+
+    jelly 模块刻意不 import 本文件（否则循环导入），于是把两者在这里拼起来，
+    DragHandle 一行都不用挪。
+    """
 
 
 class FloatWindow(QWidget):
@@ -130,17 +152,11 @@ class FloatWindow(QWidget):
         card_layout.addWidget(self._build_answer_area(), 1)
         card_layout.addWidget(self._build_footer())
 
-        # 收起后的气泡
-        self.bubble = DragHandle(self)
-        bubble_layout = QVBoxLayout(self.bubble)
-        bubble_layout.setContentsMargins(0, 0, 0, 0)
-        bubble_label = QLabel(self.bubble)
-        bubble_label.setPixmap(theme.bubble_icon(56))
-        bubble_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        bubble_layout.addWidget(bubble_label, 0, Qt.AlignCenter)
+        # 收起后的果冻悬浮球（质感与弹性都自绘，见 app/ui/jelly.py）
+        self.bubble = JellyBubbleHandle(self)
         self.bubble.clicked.connect(lambda: self.set_collapsed(False))
         self.bubble.moved.connect(self._remember_position)
-        self.bubble.setToolTip("点击展开 鸡哥解题")
+        self.bubble.setToolTip("单击展开 鸡哥解题\n按住可拖动位置\n右键抖一下")
         self.bubble.setGeometry(0, 0, COLLAPSED_SIZE.width(), COLLAPSED_SIZE.height())
         self.bubble.hide()
 
@@ -464,7 +480,9 @@ class FloatWindow(QWidget):
         self.move(x, y)
 
     def set_collapsed(self, flag: bool) -> None:
-        self._collapsed = bool(flag)
+        flag = bool(flag)
+        changed = flag != self._collapsed
+        self._collapsed = flag
         self.card.setVisible(not flag)
         self.bubble.setVisible(flag)
         # 收起时以当前窗口中心为锚点，避免气泡跑到屏幕外
@@ -479,6 +497,9 @@ class FloatWindow(QWidget):
         ui.collapsed = flag
         self.config.save()
         self._remember_position()
+        # 刚收起时让球弹出来；状态没变就别重播，免得平白闪一下
+        if flag and changed:
+            self.bubble.play_pop()
 
     def _remember_position(self) -> None:
         ui = self.config.config.ui

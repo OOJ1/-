@@ -103,8 +103,9 @@ def main() -> int:
         import main as entry  # noqa: F401  只验证可导入
         check("main.py 可导入", True)
 
-        from PySide6.QtCore import QPoint, QRect
-        from PySide6.QtGui import QColor, QImage
+        from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+        from PySide6.QtGui import QColor, QEnterEvent, QImage, QMouseEvent
+        from PySide6.QtTest import QTest
         from PySide6.QtWidgets import QApplication
 
         from app import capture as cap
@@ -114,7 +115,13 @@ def main() -> int:
         from app.engine.service import build_provider
         from app.store import SOURCE_IMAGE, SOURCE_TEXT, Store
         from app.ui import theme
-        from app.ui.float_window import FloatWindow
+        from app.ui.float_window import (
+            COLLAPSED_SIZE,
+            DRAG_THRESHOLD,
+            EXPANDED_SIZE,
+            FloatWindow,
+            JellyBubbleHandle,
+        )
         from app.ui.history_dialog import HistoryDialog
         from app.ui.overlay import CaptureOverlay
         from app.ui.settings_dialog import SettingsDialog
@@ -276,12 +283,130 @@ def main() -> int:
         window.set_collapsed(True)
         app.processEvents()
         window.grab().save(str(VERIFY / "03_float_collapsed.png"))
-        check("收起后窗口变小", window.width() == 56 and window.height() == 56,
+        check("收起后窗口变小",
+              (window.width(), window.height()) == (COLLAPSED_SIZE.width(), COLLAPSED_SIZE.height()),
               f"{window.width()}x{window.height()}")
         window.set_collapsed(False)
         app.processEvents()
-        check("展开后恢复尺寸", window.width() == 400 and window.height() == 540,
+        check("展开后恢复尺寸",
+              (window.width(), window.height()) == (EXPANDED_SIZE.width(), EXPANDED_SIZE.height()),
               f"{window.width()}x{window.height()}")
+
+        # ------------------------------------------------------ 果冻悬浮球弹性
+        print("\n=== 果冻悬浮球 ===")
+        from app.ui.jelly import JellyBubble
+
+        jelly = JellyBubble()
+        check("悬浮球可实例化", jelly is not None)
+        check("初始为静息态", abs(jelly._scale - 1.0) < 1e-6 and jelly._squash == 0.0)
+
+        def _mouse(kind, button, buttons):
+            pos = QPointF(6, 6)
+            return QMouseEvent(kind, pos, pos, button, buttons, Qt.NoModifier)
+
+        pos0 = QPointF(2, 2)
+        jelly.enterEvent(QEnterEvent(pos0, pos0, pos0))
+        # 动画是连续变化的，别在某一时刻卡单点断言（会踩在回升段上误判），扫一段取峰谷
+        peak, low = -9.0, 9.0
+        for _ in range(8):
+            QTest.qWait(40)
+            peak = max(peak, jelly._squash)
+            low = min(low, jelly._squash)
+        check("悬停先挤压成形", peak > 0.6, f"peak={peak:.3f}")
+        check("随后弹起并过冲（纵向拉长）", low < -0.1, f"low={low:.3f}")
+        QTest.qWait(620)
+        check("挤压弹起后归位", abs(jelly._squash) < 0.05, f"squash={jelly._squash:.3f}")
+        check("悬停保持放大", jelly._scale > 1.1, f"scale={jelly._scale:.3f}")
+        check("悬停点亮光晕", jelly._glow > 0.9, f"glow={jelly._glow:.3f}")
+
+        jelly.mousePressEvent(_mouse(QEvent.MouseButtonPress, Qt.LeftButton, Qt.LeftButton))
+        QTest.qWait(150)
+        check("左键按住被压扁", jelly._squash > 0.75, f"squash={jelly._squash:.3f}")
+
+        jelly.mouseReleaseEvent(_mouse(QEvent.MouseButtonRelease, Qt.LeftButton, Qt.NoButton))
+        QTest.qWait(120)
+        check("松开先过冲回弹", jelly._squash < 0.0, f"squash={jelly._squash:.3f}")
+        QTest.qWait(1100)
+        check("回弹后归位", abs(jelly._squash) < 0.05, f"squash={jelly._squash:.3f}")
+
+        # 右键：抖一下（衰减振荡，最后自己停）
+        jelly.mousePressEvent(_mouse(QEvent.MouseButtonPress, Qt.RightButton, Qt.RightButton))
+        peak, low = -9.0, 9.0
+        for _ in range(6):
+            QTest.qWait(45)
+            peak = max(peak, jelly._squash)
+            low = min(low, jelly._squash)
+        check("右键触发挤压", peak > 0.5, f"peak={peak:.3f}")
+        check("抖动出现反向过冲", low < -0.2, f"low={low:.3f}")
+        QTest.qWait(1400)
+        check("抖完自动停下", abs(jelly._squash) < 0.05, f"squash={jelly._squash:.3f}")
+
+        jelly.leaveEvent(QEvent(QEvent.Leave))
+        QTest.qWait(500)
+        check("移开后恢复静息", abs(jelly._scale - 1.0) < 1e-6, f"scale={jelly._scale:.3f}")
+        check("光晕随之熄灭", jelly._glow < 0.02, f"glow={jelly._glow:.3f}")
+
+        jelly.play_pop()
+        QTest.qWait(780)
+        check("入场弹性最终落回静息", abs(jelly._scale - 1.0) < 1e-6, f"scale={jelly._scale:.3f}")
+
+        jelly.stop_animations()
+        jelly.deleteLater()
+        app.processEvents()
+
+        # ------------------------------------------------------ 像素小鸡图案
+        print("\n=== 像素小鸡图案 ===")
+        from app.ui.theme import PIXEL_CHICK, _CHICK_COLORS, bubble_icon
+
+        widths = {len(line) for line in PIXEL_CHICK}
+        check("像素鸡每行等宽", widths == {len(PIXEL_CHICK)}, f"宽度集合={sorted(widths)}")
+        unknown = {ch for line in PIXEL_CHICK for ch in line} - set(_CHICK_COLORS) - {"."}
+        check("像素鸡只用了调色板里的字符", not unknown, f"未定义={sorted(unknown) or '无'}")
+        check("像素鸡有描边和主体两色",
+              "K" in _CHICK_COLORS and "B" in _CHICK_COLORS)
+        pm = bubble_icon(96)
+        img = pm.toImage()
+        painted = sum(
+            1 for y in range(img.height()) for x in range(img.width())
+            if img.pixelColor(x, y).alpha() > 0
+        )
+        check("果冻球画出了实际像素（不是空图）", painted > 2000, f"非透明像素={painted}")
+
+        # ------------------------------------------------------ 拖动 vs 点击
+        print("\n=== 拖动与点击的区分 ===")
+
+        def _drag_case(steps: int) -> tuple[int, int]:
+            """模拟按下后每次只挪 1px，共 steps 像素，返回 (clicked, moved) 次数。"""
+            handle = JellyBubbleHandle()
+            handle.resize(COLLAPSED_SIZE)
+            handle.show()
+            app.processEvents()
+            hits = {"clicked": 0, "moved": 0}
+            handle.clicked.connect(lambda: hits.__setitem__("clicked", hits["clicked"] + 1))
+            handle.moved.connect(lambda: hits.__setitem__("moved", hits["moved"] + 1))
+
+            def ev(kind, x, y, buttons):
+                pt = QPointF(x, y)
+                return QMouseEvent(kind, pt, pt, Qt.LeftButton, buttons, Qt.NoModifier)
+
+            handle.mousePressEvent(ev(QEvent.MouseButtonPress, 34.0, 34.0, Qt.LeftButton))
+            for i in range(1, steps + 1):
+                handle.mouseMoveEvent(ev(QEvent.MouseMove, 34.0 + i, 34.0, Qt.LeftButton))
+            handle.mouseReleaseEvent(ev(QEvent.MouseButtonRelease, 34.0 + steps, 34.0, Qt.NoButton))
+            app.processEvents()
+            handle.stop_animations()
+            handle.deleteLater()
+            return hits["clicked"], hits["moved"]
+
+        c, m = _drag_case(0)
+        check("原地松开仍算点击（能展开）", c == 1 and m == 0, f"clicked={c} moved={m}")
+        c, m = _drag_case(3)
+        check("手抖 3px 内仍算点击", c == 1 and m == 0, f"clicked={c} moved={m}")
+        # 这是真踩过的 bug：判定用了「相对上一次移动的增量」，慢速拖动每次只挪 1px，
+        # 永远够不到阈值，松手就被当成点击把球点开
+        c, m = _drag_case(40)
+        check("慢速拖动 40px 算拖动（不会误点开）", c == 0 and m == 1, f"clicked={c} moved={m}")
+        check("拖动阈值在合理范围", 4 <= DRAG_THRESHOLD <= 12, str(DRAG_THRESHOLD))
 
         # ------------------------------------------------------ 错误路径
         print("\n=== 错误路径 ===")

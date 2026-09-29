@@ -51,6 +51,89 @@ def clean_env() -> dict:
     return {k: v for k, v in os.environ.items() if k not in drop}
 
 
+# ---------------------------------------------------------------- 环境探测
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+
+
+def _pid_alive(pid: int) -> bool:
+    """判断某个 PID 是否还在运行（Windows 走 WinAPI，拿不到句柄时回退 tasklist）。"""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                try:
+                    code = wintypes.DWORD()
+                    if k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                        return code.value == _STILL_ACTIVE
+                finally:
+                    k32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            pass
+        return _pid_alive_tasklist(pid)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pid_alive_tasklist(pid: int) -> bool:
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+        ).stdout.decode("gbk", "replace")
+    except Exception:  # noqa: BLE001
+        return False
+    return f'"{pid}"' in out
+
+
+def _running_instance() -> tuple[int, str] | None:
+    """有本应用的实例正在运行时返回 (pid, 程序名)，否则 None。
+
+    判据是 data/app.lock：只有本应用的 main.py 会创建它，内容是 QLockFile
+    写出的「首行 PID」。所以「该 PID 仍存活」即可判定实例在跑。
+    """
+    lock = ROOT / "data" / "app.lock"
+    try:
+        raw = lock.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    try:
+        pid = int(lines[0])
+    except ValueError:
+        return None
+    if pid <= 0 or not _pid_alive(pid):
+        return None
+    return pid, (lines[1] if len(lines) > 1 else "?")
+
+
+# 启动测试的全部检查项名（已实例在运行时整体跳过，避免误报）
+_LAUNCH_CHECKS = (
+    "启动后进程持续存活（未崩溃）",
+    "数据目录已创建",
+    "配置文件已生成",
+    "数据库已生成",
+    "日志文件已生成",
+    "日志中有热键注册成功记录",
+    "日志无 CRITICAL/未捕获异常",
+    "默认热键为规范格式",
+    "进程已结束",
+)
+
+
 def test_hotkey() -> None:
     print("=== 全局热键真机测试 ===")
     from PySide6.QtCore import QCoreApplication, Qt, QObject
@@ -108,6 +191,22 @@ def test_launch() -> None:
     print("\n=== 应用启动真机测试 ===")
     data_dir = ROOT / "data"
     log_file = data_dir / "logs" / "app.log"
+
+    # 关键：main.py 有 QLockFile 单实例保护。若已有一个实例在跑（对这个常驻
+    # 托盘工具来说很正常），再启动会立刻走「已在运行」分支：弹出提示框，然后
+    # 以退出码 1 结束。于是「进程持续存活」会在 8 秒检查点上误报失败，而且
+    # 日志里看不出任何异常（那个分支根本不写日志）——排查成本极高。
+    # 所以先探测：探测到就明确说明并跳过，而不是给出会误导人的 FAIL。
+    running = _running_instance()
+    if running is not None:
+        pid, appname = running
+        print(f"  ! 检测到应用已在运行（PID {pid} / {appname}），它持有 data/app.lock。")
+        print("    再启动一个实例会走单实例分支并立即退出（退出码 1），")
+        print("    「进程持续存活」等检查会因此误判失败，故本组整体跳过。")
+        print("    想跑完整启动测试：先退出正在运行的鸡哥解题（托盘右键 → 退出）再重跑本脚本。")
+        for name in _LAUNCH_CHECKS:
+            skip(name, f"已有实例在运行（PID {pid}），避免单实例分支造成误判")
+        return
 
     env = clean_env()
     proc = subprocess.Popen(
@@ -239,7 +338,7 @@ def main() -> int:
     if FAIL:
         print("失败项：" + ", ".join(FAIL))
     if SKIP:
-        print("跳过项（环境限制，非应用问题）：" + ", ".join(SKIP))
+        print("跳过项（未执行，非应用问题）：" + ", ".join(SKIP))
     return 1 if FAIL else 0
 
 
